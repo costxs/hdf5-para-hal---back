@@ -31,7 +31,7 @@ CHUNK_TARGET_BYTES = 8 * 1024 * 1024
 # então o CORS só é necessário se o frontend for servido de outra origem.
 ALLOWED_ORIGINS = [
     o.strip()
-    for o in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    for o in os.getenv("CORS_ORIGINS", "*").split(",")
     if o.strip()
 ]
 
