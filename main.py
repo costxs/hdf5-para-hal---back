@@ -1,20 +1,21 @@
 """
-HDF5 -> HAL Converter API
+HDF5 -> RAW Converter API
 
 Backend FastAPI + h5py.
-- POST /api/inspect : lê a árvore (Groups/Datasets) do HDF5 e devolve metadados.
-- POST /api/convert : converte o HDF5 (todo ou um dataset específico) para .hal.
+- POST /api/inspect : lê a árvore (Groups/Datasets) do HDF5 e devolve metadados (shape, dtype, byte_size).
+- POST /api/convert : converte o dataset escolhido (ou datasets numéricos) diretamente para binário puro (.raw).
+  Se houver múltiplos datasets e nenhum for especificado, empacota todos em um .zip com arquivos .raw individuais.
 
-Os uploads são gravados em disco via streaming (sem carregar o arquivo inteiro
-em memória) e os datasets são escritos no .hal em blocos, o que permite lidar
-com arquivos grandes. Todos os temporários são removidos automaticamente.
+Os uploads são gravados em disco via streaming e os datasets são lidos e gravados
+em blocos binários para suportar arquivos volumosos sem estourar a memória RAM.
 """
 
 import math
 import os
 import shutil
 import tempfile
-from typing import Any, Dict, List, TextIO
+import zipfile
+from typing import Any, BinaryIO, Dict, List, Tuple
 
 import h5py
 import numpy as np
@@ -22,20 +23,18 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-HAL_FORMAT_VERSION = "1.0"
 VALID_EXTENSIONS = (".h5", ".hdf5")
-# Tamanho aproximado de cada bloco lido do dataset durante a escrita (bytes)
+# Tamanho aproximado de cada bloco lido do dataset durante a escrita (8 MB)
 CHUNK_TARGET_BYTES = 8 * 1024 * 1024
 
-# Origens permitidas (separadas por vírgula). Em dev o Vite já faz proxy de /api,
-# então o CORS só é necessário se o frontend for servido de outra origem.
+# Origens permitidas (separadas por vírgula).
 ALLOWED_ORIGINS = [
     o.strip()
     for o in os.getenv("CORS_ORIGINS", "*").split(",")
     if o.strip()
 ]
 
-app = FastAPI(title="HDF5 to HAL Converter API")
+app = FastAPI(title="HDF5 to RAW Converter API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -96,92 +95,135 @@ def attrs_to_dict(attrs: h5py.AttributeManager) -> Dict[str, str]:
     for k in attrs.keys():
         try:
             out[k] = to_text(attrs[k])
-        except Exception:  # atributos com tipos exóticos não devem quebrar a leitura
+        except Exception:
             out[k] = "<não legível>"
     return out
 
 
 # --------------------------------------------------------------------------- #
-# Escrita do formato .hal
+# Escrita do formato Binário Puro (.raw)
 # --------------------------------------------------------------------------- #
-def _write_rows(hal_file: TextIO, block: np.ndarray) -> None:
-    """Escreve um bloco 2D (linhas x colunas) no arquivo .hal."""
-    if block.dtype.kind in "biufc":
-        # Caminho rápido para dados numéricos
-        np.savetxt(hal_file, block, fmt="%s", delimiter="\t")
-        return
-    # Strings, bytes, objetos, tipos compostos etc.
-    for row in block:
-        hal_file.write("\t".join(to_text(v) for v in row) + "\n")
+def write_dataset_raw_binary(raw_file: BinaryIO, ds: h5py.Dataset) -> int:
+    """
+    Grava os dados brutos (buffer binário C-contiguous) no arquivo .raw.
+    Mantém o dtype original (ex.: float32, float64, int16, etc.) e endianness nativo.
+    """
+    if ds.shape is None or ds.size == 0:
+        return 0
 
+    if ds.dtype.kind in "OSU":
+        raise HTTPException(
+            status_code=400,
+            detail=f"O dataset '{ds.name}' possui tipo '{ds.dtype}' que não é numérico para exportação binária pura .raw.",
+        )
 
-def write_dataset_data(hal_file: TextIO, ds: h5py.Dataset) -> None:
-    """Escreve os dados do dataset em blocos, sem carregar tudo em memória."""
-    if ds.shape is None or ds.ndim == 0:
-        hal_file.write(to_text(ds[()]) + "\n")
-        return
-    if ds.size == 0:
-        return
-
-    source = ds.asstr() if h5py.check_string_dtype(ds.dtype) else ds
+    bytes_written = 0
+    if ds.ndim == 0:
+        data = np.asarray(ds[()])
+        b = data.tobytes()
+        raw_file.write(b)
+        return len(b)
 
     n_rows = ds.shape[0]
     row_items = int(np.prod(ds.shape[1:])) if ds.ndim > 1 else 1
     row_bytes = max(1, row_items * max(ds.dtype.itemsize, 1))
     rows_per_chunk = max(1, CHUNK_TARGET_BYTES // row_bytes)
-    cols = 1 if ds.ndim == 1 else ds.shape[-1]
 
     for start in range(0, n_rows, rows_per_chunk):
         stop = min(start + rows_per_chunk, n_rows)
-        block = np.asarray(source[start:stop])
-        # 1D -> uma coluna; ND -> achata dimensões iniciais em formato tabular
-        block = block.reshape(-1, cols) if cols > 0 else block.reshape(-1, 1)
-        _write_rows(hal_file, block)
+        # Garante array contíguo em C (row-major) com o dtype nativo
+        block = np.ascontiguousarray(ds[start:stop])
+        b = block.tobytes()
+        raw_file.write(b)
+        bytes_written += len(b)
+
+    return bytes_written
 
 
-def write_dataset_block(hal_file: TextIO, path: str, ds: h5py.Dataset) -> None:
-    hal_file.write(f"[DATASET: {path}]\n")
-    hal_file.write(f"SHAPE: {ds.shape}\n")
-    hal_file.write(f"DTYPE: {ds.dtype}\n")
-    for k, v in attrs_to_dict(ds.attrs).items():
-        hal_file.write(f"ATTR_{k}: {v}\n")
-    hal_file.write("DATA_START\n")
-    write_dataset_data(hal_file, ds)
-    hal_file.write("DATA_END\n\n")
-
-
-def convert_h5_to_hal_logic(h5_path: str, hal_path: str, target_dataset: str = "") -> int:
+def convert_h5_to_raw_logic(
+    h5_path: str,
+    base_filename: str,
+    target_dataset: str = "",
+) -> Tuple[str, str, str]:
     """
-    Lógica central de leitura do HDF5 e escrita do formato .hal.
-    Adapte a formatação de saída conforme a especificação exata do seu .hal.
-    Retorna a quantidade de datasets exportados.
+    Exporta o dataset como binário puro (.raw).
+    Se target_dataset for especificado, exporta esse dataset diretamente como .raw.
+    Se não for especificado e houver apenas 1 dataset numérico, exporta como .raw.
+    Se houver múltiplos datasets, empacota todos em um .zip com os arquivos .raw individuais.
+    Retorna: (caminho_do_arquivo_gerado, nome_do_arquivo_para_download, media_type)
     """
     target = target_dataset.strip()
 
-    with h5py.File(h5_path, "r") as h5_file, open(hal_path, "w", encoding="utf-8", newline="\n") as hal_file:
-        # Cabeçalho padrão .hal
-        hal_file.write(f"# HAL_FORMAT_VERSION: {HAL_FORMAT_VERSION}\n")
-        hal_file.write(f"# SOURCE_ATTRIBUTES: {attrs_to_dict(h5_file.attrs)}\n\n")
-
-        # Dataset específico: acesso direto, sem percorrer a árvore inteira
+    with h5py.File(h5_path, "r") as h5_file:
         if target:
             key = "/" + target.lstrip("/")
             obj = h5_file.get(key)
             if not isinstance(obj, h5py.Dataset):
                 raise HTTPException(status_code=404, detail=f"Dataset '{key}' não encontrado no arquivo.")
-            write_dataset_block(hal_file, key, obj)
-            return 1
 
-        count = 0
+            clean_name = key.strip("/").replace("/", "_")
+            out_filename = f"{base_filename}_{clean_name}.raw"
+            tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".raw")
+            output_path = tmp_out.name
+            try:
+                write_dataset_raw_binary(tmp_out, obj)
+            finally:
+                tmp_out.close()
 
-        def process_node(name: str, obj: Any) -> None:
-            nonlocal count
-            if isinstance(obj, h5py.Dataset):
-                write_dataset_block(hal_file, f"/{name}", obj)
-                count += 1
+            return output_path, out_filename, "application/octet-stream"
 
-        h5_file.visititems(process_node)
-        return count
+        # Nenhum dataset especificado: procurar todos os datasets numéricos
+        dataset_paths: List[str] = []
+
+        def visitor(name: str, obj: Any) -> None:
+            if isinstance(obj, h5py.Dataset) and obj.dtype.kind not in "OSU":
+                dataset_paths.append("/" + name)
+
+        h5_file.visititems(visitor)
+
+        if not dataset_paths:
+            raise HTTPException(
+                status_code=400,
+                detail="Nenhum dataset numérico encontrado para conversão binária .raw.",
+            )
+
+        if len(dataset_paths) == 1:
+            key = dataset_paths[0]
+            obj = h5_file[key]
+            clean_name = key.strip("/").replace("/", "_")
+            out_filename = f"{base_filename}_{clean_name}.raw"
+            tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".raw")
+            output_path = tmp_out.name
+            try:
+                write_dataset_raw_binary(tmp_out, obj)
+            finally:
+                tmp_out.close()
+            return output_path, out_filename, "application/octet-stream"
+
+        # Múltiplos datasets: criar ZIP contendo cada um como .raw
+        tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        zip_path = tmp_zip.name
+        tmp_zip.close()
+
+        try:
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for key in dataset_paths:
+                    obj = h5_file[key]
+                    clean_name = key.strip("/").replace("/", "_")
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as tmp_entry:
+                        entry_path = tmp_entry.name
+                    try:
+                        with open(entry_path, "wb") as f_entry:
+                            write_dataset_raw_binary(f_entry, obj)
+                        zf.write(entry_path, arcname=f"{clean_name}.raw")
+                    finally:
+                        cleanup_temp_files(entry_path)
+        except Exception:
+            cleanup_temp_files(zip_path)
+            raise
+
+        out_filename = f"{base_filename}_datasets_raw.zip"
+        return zip_path, out_filename, "application/zip"
 
 
 # --------------------------------------------------------------------------- #
@@ -192,11 +234,9 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-# Rotas síncronas (def): o FastAPI as executa em threadpool, então o trabalho
-# de I/O e CPU do h5py não bloqueia o event loop.
 @app.post("/api/inspect")
 def inspect_hdf5(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """Lê a árvore do arquivo HDF5 e retorna seus Groups e Datasets."""
+    """Lê a árvore do arquivo HDF5 e retorna seus Groups e Datasets com dimensões e tipo de dados."""
     filename = validate_extension(file.filename)
     tmp_path = save_upload_to_temp(file)
 
@@ -206,13 +246,17 @@ def inspect_hdf5(file: UploadFile = File(...)) -> Dict[str, Any]:
 
             def visitor(name: str, obj: Any) -> None:
                 if isinstance(obj, h5py.Dataset):
+                    itemsize = int(obj.dtype.itemsize) if hasattr(obj.dtype, "itemsize") else 1
+                    total_elements = int(obj.size) if obj.shape is not None else 0
                     nodes.append({
                         "path": f"/{name}",
                         "type": "dataset",
                         "shape": list(obj.shape) if obj.shape is not None else [],
                         "dtype": str(obj.dtype),
-                        "size": int(obj.size) if obj.shape is not None else 0,
+                        "size": total_elements,
+                        "byte_size": total_elements * itemsize,
                         "attrs": len(obj.attrs),
+                        "is_numeric": obj.dtype.kind not in "OSU",
                     })
                 elif isinstance(obj, h5py.Group):
                     nodes.append({"path": f"/{name}", "type": "group", "attrs": len(obj.attrs)})
@@ -235,35 +279,38 @@ def inspect_hdf5(file: UploadFile = File(...)) -> Dict[str, Any]:
 
 
 @app.post("/api/convert")
-def convert_hdf5_to_hal(
+def convert_hdf5_to_raw(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     target_dataset: str = Form(""),
 ) -> FileResponse:
-    """Recebe o .hdf5, executa a conversão e devolve o arquivo .hal para download."""
+    """Recebe o .hdf5, converte para binário puro .raw (ou .zip com os .raw) e devolve para download."""
     filename = validate_extension(file.filename)
-    output_filename = f"{os.path.splitext(os.path.basename(filename))[0]}.hal"
+    base_name = os.path.splitext(os.path.basename(filename))[0]
 
     input_path = save_upload_to_temp(file)
-    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".hal")
-    output_path = tmp_out.name
-    tmp_out.close()
-
+    output_path = None
     try:
-        convert_h5_to_hal_logic(input_path, output_path, target_dataset)
+        output_path, output_filename, media_type = convert_h5_to_raw_logic(
+            input_path, base_name, target_dataset
+        )
     except HTTPException:
-        cleanup_temp_files(input_path, output_path)
+        cleanup_temp_files(input_path)
+        if output_path:
+            cleanup_temp_files(output_path)
         raise
     except Exception as e:
-        cleanup_temp_files(input_path, output_path)
-        raise HTTPException(status_code=500, detail=f"Falha na conversão: {e}")
+        cleanup_temp_files(input_path)
+        if output_path:
+            cleanup_temp_files(output_path)
+        raise HTTPException(status_code=500, detail=f"Falha na conversão para RAW: {e}")
 
-    # O HDF5 de entrada não é mais necessário; o .hal é removido após o download
     cleanup_temp_files(input_path)
     background_tasks.add_task(cleanup_temp_files, output_path)
 
     return FileResponse(
         path=output_path,
         filename=output_filename,
-        media_type="application/octet-stream",
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{output_filename}"'},
     )
